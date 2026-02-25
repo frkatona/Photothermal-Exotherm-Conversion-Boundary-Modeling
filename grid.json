@@ -31,5 +31,6 @@
   "initial_temperature": 300.0,
   "initial_conversion": 0.0,
   "output_interval": 0.002,
-  "save_frames": true
+  "save_frames": true,
+  "compute_backend": "auto"
 }

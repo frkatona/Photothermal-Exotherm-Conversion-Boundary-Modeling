@@ -7,6 +7,19 @@ from typing import Callable
 
 import numpy as np
 
+try:
+    from numba import njit
+
+    NUMBA_AVAILABLE = True
+except Exception:
+    NUMBA_AVAILABLE = False
+
+    def njit(*_args, **_kwargs):  # type: ignore[misc]
+        def decorator(func):
+            return func
+
+        return decorator
+
 from .config import SimulationConfig
 from .io_utils import (
     write_arrays,
@@ -60,6 +73,78 @@ def _laplacian_robin(
     lap_y[-1, :] = (top_ghost - 2.0 * t_field[-1, :] + t_field[-2, :]) / dy2
 
     return lap_x + lap_y
+
+
+@njit(fastmath=True)
+def _searchsorted_left_numba(arr: np.ndarray, value: float) -> int:
+    lo = 0
+    hi = arr.size
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if arr[mid] < value:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+@njit(fastmath=True)
+def _searchsorted_right_numba(arr: np.ndarray, value: float) -> int:
+    lo = 0
+    hi = arr.size
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if arr[mid] <= value:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+@njit(fastmath=True)
+def _laplacian_robin_numba(
+    t_field: np.ndarray,
+    dx: float,
+    dy: float,
+    h_edge: float,
+    k_cond: float,
+    t_amb: float,
+) -> np.ndarray:
+    ny, nx = t_field.shape
+    out = np.empty_like(t_field)
+
+    dx2 = dx * dx
+    dy2 = dy * dy
+    beta_x = 2.0 * dx * h_edge / k_cond
+    beta_y = 2.0 * dy * h_edge / k_cond
+
+    for iy in range(ny):
+        for ix in range(nx):
+            t_center = t_field[iy, ix]
+
+            if ix == 0:
+                t_left = t_field[iy, 1] - beta_x * (t_field[iy, 0] - t_amb)
+            else:
+                t_left = t_field[iy, ix - 1]
+
+            if ix == nx - 1:
+                t_right = t_field[iy, nx - 2] - beta_x * (t_field[iy, nx - 1] - t_amb)
+            else:
+                t_right = t_field[iy, ix + 1]
+
+            if iy == 0:
+                t_down = t_field[1, ix] - beta_y * (t_field[0, ix] - t_amb)
+            else:
+                t_down = t_field[iy - 1, ix]
+
+            if iy == ny - 1:
+                t_up = t_field[ny - 2, ix] - beta_y * (t_field[ny - 1, ix] - t_amb)
+            else:
+                t_up = t_field[iy + 1, ix]
+
+            out[iy, ix] = (t_right - 2.0 * t_center + t_left) / dx2 + (t_up - 2.0 * t_center + t_down) / dy2
+
+    return out
 
 
 def _laser_energy_step(
@@ -132,6 +217,97 @@ def _laser_energy_step(
     return energy
 
 
+@njit(fastmath=True)
+def _laser_energy_step_numba(
+    t_now: float,
+    x: np.ndarray,
+    y: np.ndarray,
+    pulse_times: np.ndarray,
+    pulse_x: np.ndarray,
+    pulse_y: np.ndarray,
+    alpha: np.ndarray,
+    pulse_energy_prefactor: float,
+    base_absorptivity: float,
+    secondary_absorptivity: float,
+    use_secondary_absorptivity_for_reacted: bool,
+    w0: float,
+    sigma_t: float,
+    dt: float,
+    rep_rate: float,
+) -> np.ndarray:
+    ny = y.size
+    nx = x.size
+    energy = np.zeros((ny, nx), dtype=np.float64)
+    radius = 3.0 * w0
+    radius2 = radius * radius
+    inv_w0_sq = 1.0 / (w0 * w0)
+
+    center_idx = int(round(t_now * rep_rate))
+    start = center_idx - 2
+    if start < 0:
+        start = 0
+    stop = center_idx + 3
+    if stop > pulse_times.size:
+        stop = pulse_times.size
+
+    for p_idx in range(start, stop):
+        dtau = t_now - pulse_times[p_idx]
+        if dtau < 0.0:
+            abs_dtau = -dtau
+        else:
+            abs_dtau = dtau
+        if abs_dtau > 4.0 * sigma_t:
+            continue
+
+        normalized = dtau / sigma_t
+        temporal = math.exp(-0.5 * normalized * normalized) / (sigma_t * SQRT_2PI)
+        pulse_fraction = temporal * dt
+        if pulse_fraction <= 0.0:
+            continue
+
+        x0 = pulse_x[p_idx]
+        y0 = pulse_y[p_idx]
+
+        ix_min = _searchsorted_left_numba(x, x0 - radius)
+        ix_max = _searchsorted_right_numba(x, x0 + radius) - 1
+        iy_min = _searchsorted_left_numba(y, y0 - radius)
+        iy_max = _searchsorted_right_numba(y, y0 + radius) - 1
+
+        if ix_min < 0:
+            ix_min = 0
+        if iy_min < 0:
+            iy_min = 0
+        if ix_max > nx - 1:
+            ix_max = nx - 1
+        if iy_max > ny - 1:
+            iy_max = ny - 1
+        if ix_min > ix_max or iy_min > iy_max:
+            continue
+
+        for iy in range(iy_min, iy_max + 1):
+            dyv = y[iy] - y0
+            dy2 = dyv * dyv
+            for ix in range(ix_min, ix_max + 1):
+                dxv = x[ix] - x0
+                r2 = dxv * dxv + dy2
+                if r2 > radius2:
+                    continue
+
+                gaussian = math.exp(-2.0 * r2 * inv_w0_sq)
+                abs_local = base_absorptivity
+                if use_secondary_absorptivity_for_reacted:
+                    alpha_local = alpha[iy, ix]
+                    if alpha_local < 0.0:
+                        alpha_local = 0.0
+                    elif alpha_local > 1.0:
+                        alpha_local = 1.0
+                    abs_local = base_absorptivity + (secondary_absorptivity - base_absorptivity) * alpha_local
+
+                energy[iy, ix] += pulse_energy_prefactor * abs_local * gaussian * pulse_fraction
+
+    return energy
+
+
 def run_simulation(
     config: SimulationConfig,
     output_dir: str | Path,
@@ -191,6 +367,43 @@ def run_simulation(
 
     path = RasterPath(config)
     pulse_train = build_pulse_train(config, path)
+
+    if config.compute_backend == "auto":
+        compute_backend = "numba" if NUMBA_AVAILABLE else "numpy"
+    else:
+        compute_backend = config.compute_backend
+
+    if compute_backend == "numba" and not NUMBA_AVAILABLE:
+        raise RuntimeError(
+            "compute_backend='numba' requested but numba is not installed. "
+            "Install with: python -m pip install numba"
+        )
+
+    if compute_backend == "numba":
+        laplacian_step_fn = _laplacian_robin_numba
+        laser_energy_step_fn = _laser_energy_step_numba
+        # One-time warmup to avoid first-step JIT latency inside the integration loop.
+        _ = laplacian_step_fn(t_field, dx, dy, config.h_edge, k_cond, config.t_amb)
+        _ = laser_energy_step_fn(
+            time[0],
+            x,
+            y,
+            pulse_train.times,
+            pulse_train.x,
+            pulse_train.y,
+            alpha,
+            pulse_energy_prefactor,
+            base_absorptivity,
+            secondary_absorptivity,
+            reacted_props_enabled,
+            w0,
+            sigma_t,
+            config.dt,
+            config.rep_rate,
+        )
+    else:
+        laplacian_step_fn = _laplacian_robin
+        laser_energy_step_fn = _laser_energy_step
 
     frame_stride = max(1, int(round(config.output_interval / config.dt)))
     frame_idx = 0
@@ -259,33 +472,26 @@ def run_simulation(
                 )
 
             t_sub = t_now + sub * internal_dt
-            laser_energy_sub = _laser_energy_step(
-                t_now=t_sub,
-                x=x,
-                y=y,
-                pulse_times=pulse_train.times,
-                pulse_x=pulse_train.x,
-                pulse_y=pulse_train.y,
-                alpha=alpha,
-                pulse_energy_prefactor=pulse_energy_prefactor,
-                base_absorptivity=base_absorptivity,
-                secondary_absorptivity=secondary_absorptivity,
-                use_secondary_absorptivity_for_reacted=reacted_props_enabled,
-                w0=w0,
-                sigma_t=sigma_t,
-                dt=internal_dt,
-                rep_rate=config.rep_rate,
+            laser_energy_sub = laser_energy_step_fn(
+                t_sub,
+                x,
+                y,
+                pulse_train.times,
+                pulse_train.x,
+                pulse_train.y,
+                alpha,
+                pulse_energy_prefactor,
+                base_absorptivity,
+                secondary_absorptivity,
+                reacted_props_enabled,
+                w0,
+                sigma_t,
+                internal_dt,
+                config.rep_rate,
             )
             laser_energy_accum += laser_energy_sub
 
-            lap = _laplacian_robin(
-                t_field=t_field,
-                dx=dx,
-                dy=dy,
-                h_edge=config.h_edge,
-                k_cond=k_cond,
-                t_amb=config.t_amb,
-            )
+            lap = laplacian_step_fn(t_field, dx, dy, config.h_edge, k_cond, config.t_amb)
 
             diff_cool = internal_dt * (config.alpha_th * lap - cooling_coeff * (t_field - config.t_amb))
             laser_dT = laser_energy_sub / (config.rho * config.cp * config.thickness)
@@ -373,6 +579,8 @@ def run_simulation(
         "absorptivity_secondary_enabled": float(config.use_secondary_absorptivity_for_reacted),
         "emissivity_base": float(config.emissivity),
         "emissivity_secondary": float(config.secondary_emissivity),
+        "numba_available": float(NUMBA_AVAILABLE),
+        "compute_backend_numba": float(compute_backend == "numba"),
     }
 
     write_arrays(

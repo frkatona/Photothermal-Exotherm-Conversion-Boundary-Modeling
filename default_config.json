@@ -13,10 +13,10 @@
   "secondary_emissivity": 0.9,
   "h_edge": 12.0,
   "t_amb": 300.0,
-  "A": 250000.0,
+  "A": 10000000000.0,
   "Ea": 1000000.0,
   "gas_constant": 8.3,
-  "delta_h": 500000.0,
+  "delta_h": 3000000.0,
   "pulse_energy": 0.0005,
   "absorptivity": 0.1,
   "secondary_absorptivity": 0.95,
@@ -33,5 +33,6 @@
   "initial_temperature": 300.0,
   "initial_conversion": 0.0,
   "output_interval": 0.002,
-  "save_frames": true
+  "save_frames": true,
+  "compute_backend": "auto"
 }

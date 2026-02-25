@@ -50,6 +50,7 @@ class SimulationConfig:
 
     output_interval: float = 2.0e-3
     save_frames: bool = True
+    compute_backend: str = "auto"
 
     def validate(self) -> None:
         positive_names = [
@@ -99,6 +100,9 @@ class SimulationConfig:
 
         if self.pass_pattern not in {"offset_start", "cross_hatch"}:
             raise ValueError("pass_pattern must be 'offset_start' or 'cross_hatch'")
+
+        if self.compute_backend not in {"auto", "numpy", "numba"}:
+            raise ValueError("compute_backend must be one of: auto, numpy, numba")
 
         inset = self.spot_diameter
         if self.width <= 2.0 * inset or self.height <= 2.0 * inset:
