@@ -442,6 +442,7 @@ def run_simulation(
         )
     internal_dt = config.dt / substeps_per_step
     progress_stride = max(1, n_steps // 400)
+    early_progress_steps = min(200, n_steps)
 
     if progress_callback is not None:
         progress_callback(
@@ -537,7 +538,12 @@ def run_simulation(
         cumulative_reaction_energy[step + 1] = cumulative_reaction_energy[step] + reaction_step_j
         cumulative_radiative_energy[step + 1] = cumulative_radiative_energy[step] + radiative_step_j
 
-        if progress_callback is not None and (((step + 1) % progress_stride == 0) or (step == n_steps - 1)):
+        should_report = (
+            (step + 1) <= early_progress_steps
+            or ((step + 1) % progress_stride == 0)
+            or (step == n_steps - 1)
+        )
+        if progress_callback is not None and should_report:
             progress_callback(
                 {
                     "percent": 100.0 * (step + 1) / n_steps,

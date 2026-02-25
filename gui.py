@@ -245,6 +245,53 @@ class RuntimeState:
 RUNTIME = RuntimeState()
 
 
+class ExportState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.running = False
+        self.percent = 0.0
+        self.detail = "Ready to export MP4."
+        self.target = ""
+
+    def start(self, target: str) -> bool:
+        with self.lock:
+            if self.running:
+                return False
+            self.running = True
+            self.percent = 0.0
+            self.target = target
+            self.detail = "starting"
+        return True
+
+    def update(self, percent: float, detail: str) -> None:
+        with self.lock:
+            self.percent = max(0.0, min(100.0, float(percent)))
+            self.detail = detail
+
+    def finish(self, detail: str) -> None:
+        with self.lock:
+            self.running = False
+            self.percent = 100.0
+            self.detail = detail
+
+    def fail(self, detail: str) -> None:
+        with self.lock:
+            self.running = False
+            self.detail = detail
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "running": self.running,
+                "percent": self.percent,
+                "detail": self.detail,
+                "target": self.target,
+            }
+
+
+EXPORT_STATE = ExportState()
+
+
 def resolve_path(raw: str | None, fallback: str) -> Path:
     text = (raw or "").strip()
     return Path(text or fallback).expanduser()
@@ -357,6 +404,121 @@ def empty_fig(title: str, text: str, plot_font: str, scheme: dict[str, str], sho
     return style_figure(fig, plot_font, scheme, show_legend)
 
 
+def frame_files_for_output(out_dir: Path) -> list[Path]:
+    return sorted((out_dir / "frames").glob("frame_*.npz"))
+
+
+def frame_slider_marks(frame_count: int) -> dict[int, str]:
+    if frame_count <= 0:
+        return {0: "0"}
+    if frame_count == 1:
+        return {0: "1"}
+    last = frame_count - 1
+    idxs = {0, last, last // 4, last // 2, (3 * last) // 4}
+    return {i: str(i + 1) for i in sorted(idxs)}
+
+
+def load_animation_frame_fig(
+    out_dir: Path,
+    frame_files: list[Path],
+    frame_index: int,
+    plot_font: str,
+    scheme: dict[str, str],
+    show_legend: bool,
+) -> tuple[go.Figure, int, float | None, str]:
+    frame_count = len(frame_files)
+    if frame_count == 0:
+        fig = empty_fig(
+            "Animation Player",
+            "No frame snapshots found. Run simulation with save_frames=true.",
+            plot_font,
+            scheme,
+            show_legend,
+        )
+        return fig, 0, None, "No frames available."
+
+    req = [out_dir / "x.npy", out_dir / "y.npy"]
+    if not all(p.exists() for p in req):
+        fig = empty_fig("Animation Player", f"Missing required grid outputs in {out_dir}.", plot_font, scheme, show_legend)
+        return fig, max(0, min(frame_count - 1, frame_index)), None, "Missing grid arrays."
+
+    idx = max(0, min(frame_count - 1, int(frame_index)))
+    frame_path = frame_files[idx]
+
+    try:
+        x = np.load(out_dir / "x.npy") * 1e3
+        y = np.load(out_dir / "y.npy") * 1e3
+        with np.load(frame_path) as frame:
+            t_field = frame["temperature"]
+            alpha = frame["conversion"]
+            time_s = float(frame["time_s"])
+            if "laser_energy" in frame.files:
+                laser_energy = frame["laser_energy"]
+            else:
+                laser_energy = np.zeros_like(t_field)
+    except Exception as exc:
+        fig = empty_fig("Animation Player", f"Failed to load frame: {exc}", plot_font, scheme, show_legend)
+        return fig, idx, None, str(exc)
+
+    dt = 1.0
+    cfg_path = out_dir / "config_used.json"
+    if cfg_path.exists():
+        try:
+            cfg = SimulationConfig.from_json(cfg_path)
+            dt = max(float(cfg.dt), 1e-12)
+        except Exception:
+            dt = 1.0
+    laser_power_density = laser_energy / dt
+
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=(
+            "Temperature (K)",
+            "Conversion",
+            "Laser Power Density (W/m^2)",
+            "Global Histories",
+        ),
+        specs=[[{"type": "heatmap"}, {"type": "heatmap"}], [{"type": "heatmap"}, {"type": "xy"}]],
+    )
+
+    fig.add_trace(go.Heatmap(x=x, y=y, z=t_field, colorscale="Inferno", showscale=False), row=1, col=1)
+    fig.add_trace(go.Heatmap(x=x, y=y, z=alpha, colorscale="Viridis", zmin=0.0, zmax=1.0, showscale=False), row=1, col=2)
+    fig.add_trace(go.Heatmap(x=x, y=y, z=laser_power_density, colorscale="Plasma", showscale=False), row=2, col=1)
+
+    try:
+        ht, hmax, htot, _, _, hlaser, hreact = load_global_history(out_dir)
+        if ht.size > 0:
+            norm = np.clip(htot / float(np.max(htot)) if float(np.max(htot)) > 0.0 else htot, 0.0, 1.0)
+            fig.add_trace(go.Scatter(x=ht, y=hmax, mode="lines", name="Max Temperature (K)", line={"color": "#f87171"}), row=2, col=2)
+            fig.add_trace(go.Scatter(x=ht, y=norm, mode="lines", name="Norm Conversion", line={"color": "#34d399"}), row=2, col=2)
+            fig.add_trace(go.Scatter(x=ht, y=hlaser, mode="lines", name="Cum Laser (J)", line={"color": "#60a5fa"}), row=2, col=2)
+            fig.add_trace(go.Scatter(x=ht, y=hreact, mode="lines", name="Cum Reaction (J)", line={"color": "#fb923c"}), row=2, col=2)
+            fig.add_vline(x=time_s, line_width=1.5, line_dash="dash", line_color="#f8fafc", row=2, col=2)
+    except Exception:
+        fig.add_annotation(
+            text="global_history.csv not available",
+            x=0.5,
+            y=0.5,
+            xref="x4 domain",
+            yref="y4 domain",
+            showarrow=False,
+            font={"size": 12, "color": scheme["text_soft"]},
+        )
+
+    fig.update_xaxes(title="x (mm)", row=1, col=1)
+    fig.update_yaxes(title="y (mm)", row=1, col=1, scaleanchor="x", scaleratio=1)
+    fig.update_xaxes(title="x (mm)", row=1, col=2)
+    fig.update_yaxes(title="y (mm)", row=1, col=2, scaleanchor="x2", scaleratio=1)
+    fig.update_xaxes(title="x (mm)", row=2, col=1)
+    fig.update_yaxes(title="y (mm)", row=2, col=1, scaleanchor="x3", scaleratio=1)
+    fig.update_xaxes(title="time (s)", row=2, col=2)
+    fig.update_yaxes(title="value", row=2, col=2)
+    fig.update_layout(title=f"Frame {idx + 1}/{frame_count} | t = {time_s:.6g} s")
+    style_figure(fig, plot_font, scheme, show_legend)
+    return fig, idx, time_s, f"Loaded {frame_path.name}"
+
+
 def load_figs(
     out_dir: Path,
     plot_font: str,
@@ -457,6 +619,30 @@ def sim_worker(cfg: SimulationConfig, cfg_path: Path, out_dir: Path) -> None:
     except Exception as exc:
         RUNTIME.append_log(f"Simulation failed: {exc}")
         RUNTIME.finish("Solver failed", str(exc))
+
+
+def mp4_export_worker(out_dir: Path, mp4_path: Path, fps: int, dpi: int) -> None:
+    try:
+        from animate_results import create_animation
+
+        def on_progress(percent: float, detail: str) -> None:
+            EXPORT_STATE.update(percent, detail)
+
+        saved_path = create_animation(
+            output_dir=out_dir,
+            mp4_path=mp4_path,
+            fps=fps,
+            dpi=dpi,
+            progress_callback=on_progress,
+            cancel_check=None,
+        )
+        msg = f"MP4 saved: {saved_path}"
+        EXPORT_STATE.finish(msg)
+        RUNTIME.append_log(msg)
+    except Exception as exc:
+        msg = f"MP4 export failed: {exc}"
+        EXPORT_STATE.fail(msg)
+        RUNTIME.append_log(msg)
 
 
 def initial_rows() -> list[dict[str, str]]:
@@ -665,6 +851,11 @@ app.index_string = """<!DOCTYPE html>
         height: 100%;
         width: 0%;
         background: linear-gradient(90deg, #ab1418, #ff4248);
+        transition: width 0.2s ease;
+      }
+      @keyframes progress-indeterminate {
+        0% { background-position: 0 0; }
+        100% { background-position: 36px 0; }
       }
       .progress-text {
         margin-top: 4px;
@@ -707,6 +898,35 @@ app.index_string = """<!DOCTYPE html>
         width: 100%;
         margin-bottom: 10px;
       }
+      .menu-dropdown .Select-control {
+        background: #f5f8fc;
+        border: 1px solid #b8c5d6;
+        color: #0f1726;
+      }
+      .menu-dropdown .Select-value-label,
+      .menu-dropdown .Select-placeholder {
+        color: #0f1726 !important;
+      }
+      .menu-dropdown .Select-input > input {
+        color: #0f1726 !important;
+      }
+      .menu-dropdown .Select-menu-outer {
+        background: #f5f8fc;
+        border: 1px solid #b8c5d6;
+        color: #0f1726;
+      }
+      .menu-dropdown .Select-option {
+        background: #f5f8fc;
+        color: #0f1726;
+      }
+      .menu-dropdown .Select-option.is-focused {
+        background: #e4ecf6;
+        color: #0f1726;
+      }
+      .menu-dropdown .Select-option.is-selected {
+        background: #d4e3f4;
+        color: #0b1220;
+      }
       .menu-label {
         margin-top: 0;
         margin-bottom: 6px;
@@ -717,27 +937,43 @@ app.index_string = """<!DOCTYPE html>
       }
       .slider-readout {
         margin-top: 8px;
-        color: #d5dee8;
-        font-size: 0.88rem;
+        color: #eef4fb;
+        font-size: 0.92rem;
+        font-weight: 600;
       }
       .rc-slider-rail {
-        background-color: #3a4657 !important;
+        background-color: #4d5b71 !important;
       }
       .rc-slider-track {
-        background-color: #ff4d5a !important;
+        background: linear-gradient(90deg, #ff5d68, #ff7f87) !important;
       }
       .rc-slider-handle {
-        border-color: #ff9aa5 !important;
-        background-color: #fff4f5 !important;
+        border-color: #ffd6db !important;
+        border-width: 2px !important;
+        background-color: #ffeef1 !important;
+        box-shadow: 0 0 0 3px rgba(232, 33, 39, 0.24) !important;
       }
       .rc-slider-dot {
-        border-color: #59657a !important;
+        border-color: #7f8ca0 !important;
+        background-color: #10161f !important;
       }
       .rc-slider-dot-active {
-        border-color: #ff6b77 !important;
+        border-color: #ff9ea8 !important;
       }
-      .rc-slider-mark-text {
-        color: #c7d2e0 !important;
+      .rc-slider-mark-text,
+      .rc-slider-mark-text-active {
+        color: #e6edf7 !important;
+        font-size: 0.82rem !important;
+        font-weight: 600 !important;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+      }
+      .rc-slider-tooltip-inner {
+        color: #0f1726 !important;
+        background: #f4f7fb !important;
+        border: 1px solid #a9b7c9 !important;
+      }
+      .rc-slider-tooltip-arrow::before {
+        border-top-color: #f4f7fb !important;
       }
       .menu-checklist label {
         display: block;
@@ -965,6 +1201,57 @@ app.layout = html.Div(
             id="graph-grid",
             className="graph-grid",
             children=[
+                html.Div(
+                    className="panel",
+                    children=[
+                        html.H3("Animation Player", className="panel-title"),
+                        html.Div(
+                            className="button-row",
+                            children=[
+                                html.Button("Play Animation", id="btn-anim-toggle", className="tesla-btn"),
+                                html.Button("Reload Frames", id="btn-anim-refresh", className="tesla-btn"),
+                                html.Button("Export MP4", id="btn-export-mp4", className="tesla-btn btn-primary"),
+                            ],
+                        ),
+                        html.Div(
+                            className="control-grid",
+                            children=[
+                                dcc.Input(
+                                    id="mp4-path",
+                                    type="text",
+                                    value="outputs/latest/simulation.mp4",
+                                    className="tesla-input",
+                                ),
+                                html.Div(
+                                    children=[
+                                        html.Div("Animation FPS", className="menu-label"),
+                                        dcc.Slider(
+                                            id="anim-fps-slider",
+                                            min=2,
+                                            max=30,
+                                            step=1,
+                                            value=10,
+                                            marks={2: "2", 6: "6", 10: "10", 20: "20", 30: "30"},
+                                            tooltip={"always_visible": False, "placement": "bottom"},
+                                        ),
+                                    ]
+                                ),
+                            ],
+                        ),
+                        dcc.Slider(
+                            id="anim-frame-slider",
+                            min=0,
+                            max=0,
+                            step=1,
+                            value=0,
+                            marks={0: "0"},
+                            tooltip={"always_visible": False, "placement": "bottom"},
+                        ),
+                        html.Div(id="anim-frame-label", className="slider-readout"),
+                        html.Div(id="anim-export-status", className="action-msg"),
+                        dcc.Graph(id="fig-animation", style={"height": "420px"}, config={"displaylogo": False}),
+                    ],
+                ),
                 html.Div(className="panel", children=[dcc.Graph(id="fig-final", style={"height": "420px"}, config={"displaylogo": False})]),
                 html.Div(className="panel", children=[dcc.Graph(id="fig-peak", style={"height": "420px"}, config={"displaylogo": False})]),
                 html.Div(className="panel", children=[dcc.Graph(id="fig-conv", style={"height": "420px"}, config={"displaylogo": False})]),
@@ -974,7 +1261,9 @@ app.layout = html.Div(
             ],
         ),
         dcc.Store(id="menu-open", data=False),
+        dcc.Store(id="anim-playing", data=False),
         dcc.Interval(id="poll", interval=800, n_intervals=0),
+        dcc.Interval(id="anim-tick", interval=100, n_intervals=0, disabled=True),
     ],
 )
 
@@ -999,6 +1288,7 @@ def toggle_menu(n_clicks: int | None, is_open: bool | None) -> bool:
     Output("poll", "interval"),
     Output("app-shell", "style"),
     Output("graph-grid", "style"),
+    Output("fig-animation", "style"),
     Output("fig-final", "style"),
     Output("fig-peak", "style"),
     Output("fig-conv", "style"),
@@ -1025,6 +1315,7 @@ def update_display_controls(
     str,
     str,
     int,
+    dict[str, str],
     dict[str, str],
     dict[str, str],
     dict[str, str],
@@ -1070,6 +1361,7 @@ def update_display_controls(
         refresh_ms,
         shell_style,
         grid_style,
+        graph_style,
         graph_style,
         graph_style,
         graph_style,
@@ -1170,6 +1462,145 @@ def handle_actions(
 
 
 @app.callback(
+    Output("anim-playing", "data"),
+    Output("btn-anim-toggle", "children"),
+    Output("anim-tick", "disabled"),
+    Output("anim-tick", "interval"),
+    Output("anim-frame-slider", "max"),
+    Output("anim-frame-slider", "marks"),
+    Output("anim-frame-slider", "value"),
+    Input("anim-tick", "n_intervals"),
+    Input("btn-anim-toggle", "n_clicks"),
+    Input("btn-anim-refresh", "n_clicks"),
+    Input("btn-refresh", "n_clicks"),
+    Input("anim-fps-slider", "value"),
+    Input("output-dir", "value"),
+    State("anim-playing", "data"),
+    State("anim-frame-slider", "value"),
+)
+def update_animation_clock(
+    _: int,
+    __: int | None,
+    ___: int | None,
+    ____: int | None,
+    fps_value: int | None,
+    out_dir_text: str | None,
+    playing_data: bool | None,
+    frame_value: int | None,
+) -> tuple[bool, str, bool, int, int, dict[int, str], int]:
+    trigger = ctx.triggered_id
+    playing = bool(playing_data)
+    fps = int(fps_value or 10)
+    fps = max(2, min(30, fps))
+    interval_ms = max(33, int(round(1000.0 / fps)))
+    out_dir = resolve_path(out_dir_text, "outputs/latest")
+    frame_files = frame_files_for_output(out_dir)
+    frame_count = len(frame_files)
+
+    if trigger == "btn-anim-toggle":
+        playing = not playing
+
+    if frame_count <= 0:
+        return False, "Play Animation", True, interval_ms, 0, {0: "0"}, 0
+
+    max_idx = frame_count - 1
+    idx = int(frame_value or 0)
+    idx = max(0, min(max_idx, idx))
+
+    if trigger == "anim-tick" and playing:
+        idx = 0 if idx >= max_idx else idx + 1
+
+    return (
+        playing,
+        "Pause Animation" if playing else "Play Animation",
+        not playing,
+        interval_ms,
+        max_idx,
+        frame_slider_marks(frame_count),
+        idx,
+    )
+
+
+@app.callback(
+    Output("fig-animation", "figure"),
+    Output("anim-frame-label", "children"),
+    Input("anim-frame-slider", "value"),
+    Input("output-dir", "value"),
+    Input("font-selector", "value"),
+    Input("color-scheme-selector", "value"),
+    Input("plot-options-checklist", "value"),
+    Input("anim-fps-slider", "value"),
+)
+def render_animation_frame(
+    frame_value: int | None,
+    out_dir_text: str | None,
+    font_value: str | None,
+    scheme_value: str | None,
+    plot_options: list[str] | None,
+    fps_value: int | None,
+) -> tuple[go.Figure, str]:
+    out_dir = resolve_path(out_dir_text, "outputs/latest")
+    frame_files = frame_files_for_output(out_dir)
+    frame_count = len(frame_files)
+    plot_font = FONT_OPTIONS.get(str(font_value), FONT_OPTIONS["source"])
+    scheme = COLOR_SCHEMES.get(str(scheme_value), COLOR_SCHEMES["tesla_dark"])
+    opts = set(plot_options or [])
+    show_legend = "legend" in opts
+    fps = int(fps_value or 10)
+    fps = max(2, min(30, fps))
+
+    fig, idx, frame_time, detail = load_animation_frame_fig(
+        out_dir,
+        frame_files,
+        int(frame_value or 0),
+        plot_font,
+        scheme,
+        show_legend,
+    )
+
+    if frame_count <= 0 or frame_time is None:
+        return fig, f"{detail} | target {fps} FPS"
+    return fig, f"Frame {idx + 1}/{frame_count} | t = {frame_time:.6g} s | target {fps} FPS"
+
+
+@app.callback(
+    Output("anim-export-status", "children"),
+    Output("btn-export-mp4", "disabled"),
+    Input("btn-export-mp4", "n_clicks"),
+    Input("poll", "n_intervals"),
+    State("output-dir", "value"),
+    State("mp4-path", "value"),
+    State("anim-fps-slider", "value"),
+)
+def handle_mp4_export(
+    _: int | None,
+    __: int,
+    out_dir_text: str | None,
+    mp4_path_text: str | None,
+    fps_value: int | None,
+) -> tuple[str, bool]:
+    trigger = ctx.triggered_id
+    out_dir = resolve_path(out_dir_text, "outputs/latest")
+    default_mp4 = str(out_dir / "simulation.mp4")
+    mp4_path = resolve_path(mp4_path_text, default_mp4)
+    fps = int(fps_value or 10)
+    fps = max(2, min(30, fps))
+
+    if trigger == "btn-export-mp4":
+        if EXPORT_STATE.start(str(mp4_path)):
+            RUNTIME.append_log(f"MP4 export started -> {mp4_path}")
+            threading.Thread(target=mp4_export_worker, args=(out_dir, mp4_path, fps, 140), daemon=True).start()
+        else:
+            RUNTIME.append_log("MP4 export is already running.")
+
+    snap = EXPORT_STATE.snapshot()
+    if snap["running"]:
+        target = snap["target"] or str(mp4_path)
+        return f"Exporting MP4: {snap['percent']:.1f}% | {snap['detail']} | {target}", True
+    return str(snap["detail"]), False
+
+
+@app.callback(
     Output("status-text", "children"),
     Output("status-detail", "children"),
     Output("progress-fill", "style"),
@@ -1212,11 +1643,23 @@ def refresh(
     log_lines = int(log_lines_value or 250)
     log_lines = max(50, min(400, log_lines))
     visible_logs = snap["logs"][-log_lines:]
+    percent = float(snap["percent"])
+    if snap["running"] and percent <= 0.0:
+        fill_style: dict[str, str] = {
+            "width": "6%",
+            "background": "repeating-linear-gradient(90deg, #ff7a80 0, #ff7a80 12px, #d81f24 12px, #d81f24 24px)",
+            "backgroundSize": "36px 100%",
+            "animation": "progress-indeterminate 0.9s linear infinite",
+        }
+        progress_text = "Starting..."
+    else:
+        fill_style = {"width": f"{percent:.1f}%"}
+        progress_text = f"{percent:.1f}%"
     return (
         snap["status"],
         snap["detail"],
-        {"width": f"{snap['percent']:.1f}%"},
-        f"{snap['percent']:.1f}%",
+        fill_style,
+        progress_text,
         "\n".join(visible_logs) if visible_logs else "(no log entries)",
         snap["running"],
         not snap["running"],
